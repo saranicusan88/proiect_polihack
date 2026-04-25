@@ -63,7 +63,7 @@ export default function AuthPage() {
       <div className="auth-left">
         <div className="auth-brand">
           <span className="auth-brand-icon">◎</span>
-          <span className="auth-brand-name">LearnLoop</span>
+          <span className="auth-brand-name">QuickLearn</span>
         </div>
         <div className="auth-left-content">
           <h1 className="auth-headline">

@@ -3,7 +3,7 @@ import { supabase } from "../supabaseClient";
 import "../styles/Dashboard.css";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const FACULTIES = ["Automatică și Calculatoare", "Electronică", "Electrotehnică", "Mecanică"];
+const FACULTIES = ["Automatică și Calculatoare", "Electronică", "Electrotehnică", "Mecanică","Matematică și Informatică","Fizică", "Chimie", "Biologie","Economie", "Drept", "Medicină","Psihologie", "Sociologie", "Litere", "Istorie", "Filosofie","Arte"];
 const YEARS = [1, 2, 3, 4];
 const SEMESTERS = [1, 2];
 const LEARN_MODES = [
@@ -29,6 +29,14 @@ function parseMinutes(text) {
   return null;
 }
 
+function normalizeText(value) {
+  return (value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 export default function Dashboard({ session }) {
   const user = session.user;
@@ -46,6 +54,7 @@ export default function Dashboard({ session }) {
   const [sessionMinutes, setSessionMinutes] = useState(null);
   const [chosenSubject, setChosenSubject] = useState(null);
   const chatEndRef = useRef(null);
+  const initializedRef = useRef(false);
 
   // Session / quiz state
   const [sessionId, setSessionId] = useState(null);
@@ -65,8 +74,11 @@ export default function Dashboard({ session }) {
 
   // ── On mount: greet + load streak ─────────────────────────────────────────
   useEffect(() => {
-    addBot("Bună! 👋 Sunt aici să te ajut să înveți. Cât timp ai la dispoziție să exersezi cu mine?");
-    setStage(STAGE.ASK_TIME);
+    if (!initializedRef.current) {
+      initializedRef.current = true;
+      addBot("Bună! 👋 Sunt aici să te ajut să înveți. Cât timp ai la dispoziție să exersezi cu mine?");
+      setStage(STAGE.ASK_TIME);
+    }
     loadStreak();
   }, []);
 
@@ -175,52 +187,123 @@ export default function Dashboard({ session }) {
   }
 
   // ── Fetch next item ────────────────────────────────────────────────────────
-  async function fetchQuiz() {
-    let query = supabase
-      .from("quiz_questions")
-      .select(`
-        id, question, option_a, option_b, option_c, correct_option, explanation, estimated_minutes,
-        topics!inner(name, subjects!inner(name, year, semester, faculty_id))
-      `)
-      .limit(20);
+  async function getSelectedFacultyIds() {
+    const { data, error } = await supabase
+      .from("faculties")
+      .select("id, name");
 
-    if (learnMode === "current") {
-      query = query
-        .eq("topics.subjects.year", year)
-        .eq("topics.subjects.semester", semester);
-    } else if (learnMode === "past") {
-      query = query.lt("topics.subjects.year", year);
+    if (error || !data?.length) return [];
+
+    const selected = normalizeText(faculty);
+    return data
+      .filter((f) => {
+        const dbName = normalizeText(f.name);
+        return dbName === selected || dbName.includes(selected) || selected.includes(dbName);
+      })
+      .map((f) => f.id);
+  }
+
+  async function getFilteredTopics() {
+    const facultyIds = await getSelectedFacultyIds();
+
+    let subjectQuery = supabase
+      .from("subjects")
+      .select("id, name, year, semester, faculty_id");
+
+    if (facultyIds.length) {
+      subjectQuery = subjectQuery.in("faculty_id", facultyIds);
     }
 
-    const { data, error } = await query;
+    if (learnMode === "current") {
+      subjectQuery = subjectQuery.eq("year", year).eq("semester", semester);
+    } else if (learnMode === "past") {
+      subjectQuery = subjectQuery.or(`year.lt.${year},and(year.eq.${year},semester.lt.${semester})`);
+    }
+
+    const { data: subjects, error: subjectsError } = await subjectQuery;
+    if (subjectsError || !subjects?.length) return [];
+
+    const subjectIds = subjects.map((s) => s.id);
+    const subjectNameById = Object.fromEntries(subjects.map((s) => [s.id, s.name]));
+
+    const { data: topics, error: topicsError } = await supabase
+      .from("topics")
+      .select("id, name, subject_id")
+      .in("subject_id", subjectIds)
+      .limit(500);
+
+    if (topicsError || !topics?.length) return [];
+
+    const selectedText = normalizeText(chosenSubject);
+    if (!selectedText) return topics;
+
+    return topics.filter((t) => {
+      const topicName = normalizeText(t.name);
+      const subjectName = normalizeText(subjectNameById[t.subject_id]);
+      return topicName.includes(selectedText) || subjectName.includes(selectedText);
+    });
+  }
+
+  async function fetchQuiz() {
+    const topics = await getFilteredTopics();
+    if (!topics.length) return null;
+
+    const topicIds = topics.map((t) => t.id);
+    const topicNameById = Object.fromEntries(topics.map((t) => [t.id, t.name]));
+
+    const { data, error } = await supabase
+      .from("quiz_questions")
+      .select("id, question, option_a, option_b, option_c, correct_option, explanation, estimated_minutes, topic_id")
+      .in("topic_id", topicIds)
+      .limit(200);
+
     if (error || !data?.length) return null;
 
-    // Shuffle + pick one not seen this session
-    const shuffled = data.sort(() => Math.random() - 0.5);
-    return shuffled[0];
+    const enriched = data.map((q) => ({
+      ...q,
+      topics: { name: topicNameById[q.topic_id] || "" },
+    }));
+
+    return enriched.sort(() => Math.random() - 0.5)[0];
   }
 
   async function fetchContent() {
-    let query = supabase
+    const topics = await getFilteredTopics();
+    if (!topics.length) return null;
+
+    const topicIds = topics.map((t) => t.id);
+    const topicNameById = Object.fromEntries(topics.map((t) => [t.id, t.name]));
+
+    const { data, error } = await supabase
       .from("content_items")
-      .select(`
-        id, type, title, body, estimated_minutes,
-        topics!inner(name, subjects!inner(name, year, semester))
-      `)
-      .in("type", ["explanation", "example"])
-      .limit(20);
+      .select("*")
+      .in("topic_id", topicIds)
+      .limit(200);
 
-    if (learnMode === "current") {
-      query = query
-        .eq("topics.subjects.year", year)
-        .eq("topics.subjects.semester", semester);
-    } else if (learnMode === "past") {
-      query = query.lt("topics.subjects.year", year);
-    }
-
-    const { data, error } = await query;
     if (error || !data?.length) return null;
-    return data[Math.floor(Math.random() * data.length)];
+
+    const allowedTypes = new Set([
+      "explanation",
+      "example",
+      "explicatie",
+      "exemplu",
+      "concept",
+    ]);
+
+    const filteredByType = data.filter((item) => {
+      if (!item.type) return true;
+      return allowedTypes.has(normalizeText(item.type));
+    });
+
+    const source = filteredByType.length ? filteredByType : data;
+
+    const enriched = source.map((item) => ({
+      ...item,
+      body: item.body || item.content || item.text || item.description || "",
+      topics: { name: topicNameById[item.topic_id] || "" },
+    }));
+
+    return enriched[Math.floor(Math.random() * enriched.length)];
   }
 
   // ── Handle button clicks ───────────────────────────────────────────────────
@@ -233,9 +316,9 @@ export default function Dashboard({ session }) {
 
     const item = await fetchQuiz();
     if (!item) {
-      addBot("Nu am găsit întrebări pentru filtrele selectate. Încearcă alt mod de învățare.");
-      return;
-    }
+    addBot(`Nu am găsit întrebări pentru "${chosenSubject || "filtrele selectate"}". Verifică numele materiei sau schimbă filtrul de an/semestru.`);
+    return;
+}
 
     setCurrentItem({ type: "quiz", data: item });
     setItemStartTime(Date.now());
@@ -279,7 +362,8 @@ export default function Dashboard({ session }) {
     setAnswered(true);
 
     const item = currentItem.data;
-    const isCorrect = option === item.correct_option;
+    const isCorrect = option.toLowerCase().trim() === item.correct_option?.toLowerCase().trim();
+
 
     // Save answer
     if (sessionId) {
@@ -335,6 +419,32 @@ export default function Dashboard({ session }) {
     }
   }
 
+  async function handleStopSession() {
+    if (!sessionId && minutesLeft === null) return;
+
+    if (sessionId) {
+      await supabase
+        .from("learning_sessions")
+        .update({ ended_at: new Date().toISOString() })
+        .eq("id", sessionId);
+    }
+
+    setSessionDone(false);
+    setCurrentItem(null);
+    setActivePanel(null);
+    setSelectedOption(null);
+    setAnswered(false);
+    setItemStartTime(null);
+    setSessionId(null);
+    setSessionMinutes(null);
+    setMinutesLeft(null);
+    setChosenSubject(null);
+    setStats({ items: 0, correct: 0 });
+    setStage(STAGE.ASK_TIME);
+
+    addBot("Am oprit sesiunea curentă. Spune-mi cât timp ai la dispoziție pentru o sesiune nouă.");
+  }
+
   // ── Logout ─────────────────────────────────────────────────────────────────
   async function handleLogout() {
     await supabase.auth.signOut();
@@ -350,7 +460,7 @@ export default function Dashboard({ session }) {
       <header className="dash-header">
         <div className="dash-brand">
           <span className="dash-brand-icon">◎</span>
-          <span className="dash-brand-name">LearnLoop</span>
+          <span className="dash-brand-name">QuickLearn</span>
         </div>
 
         <div className="dash-header-center">
@@ -435,6 +545,11 @@ export default function Dashboard({ session }) {
                 <span className="btn-icon">🧠</span>
                 Quiz-uri
               </button>
+              {minutesLeft !== null && (
+                <button className="action-btn stop-btn" onClick={handleStopSession}>
+                  Oprește sesiunea
+                </button>
+              )}
               {currentItem && (
                 <button className="action-btn next-btn" onClick={handleNext}>
                   Next →
@@ -511,6 +626,36 @@ export default function Dashboard({ session }) {
 
 // ─── QuizCard ──────────────────────────────────────────────────────────────────
 function QuizCard({ data, selectedOption, answered, onAnswer }) {
+  // ✅ Normalizează correct_option o singură dată
+  const correctOpt = data.correct_option?.toLowerCase().trim();
+  const explanationText = (data.explanation || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const explanationHasCorrectAnswerText =
+    explanationText.includes("raspunsul corect era") ||
+    explanationText.includes("varianta corecta") ||
+    explanationText.includes("correct answer");
+  const cleanedExplanation = (data.explanation || "")
+    .split("\n")
+    .filter((line) => {
+      const normalized = line
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .trim();
+
+      if (!normalized) return false;
+
+      return !(
+        normalized.includes("raspuns corect") ||
+        normalized.includes("raspunsul corect") ||
+        normalized.includes("varianta corecta") ||
+        normalized.includes("correct answer")
+      );
+    })
+    .join("\n");
+
   const options = [
     { key: "a", label: data.option_a },
     { key: "b", label: data.option_b },
@@ -519,8 +664,8 @@ function QuizCard({ data, selectedOption, answered, onAnswer }) {
 
   function getOptionClass(key) {
     if (!answered) return selectedOption === key ? "option selected" : "option";
-    if (key === data.correct_option) return "option correct";
-    if (key === selectedOption && key !== data.correct_option) return "option wrong";
+    if (key === correctOpt) return "option correct";                              // ✅
+    if (key === selectedOption && key !== correctOpt) return "option wrong";      // ✅
     return "option";
   }
 
@@ -546,10 +691,10 @@ function QuizCard({ data, selectedOption, answered, onAnswer }) {
           >
             <span className="option-letter">{opt.key.toUpperCase()}</span>
             <span className="option-text">{opt.label}</span>
-            {answered && opt.key === data.correct_option && (
+            {answered && opt.key === correctOpt && (               // ✅
               <span className="option-check">✓</span>
             )}
-            {answered && opt.key === selectedOption && opt.key !== data.correct_option && (
+            {answered && opt.key === selectedOption && opt.key !== correctOpt && (  // ✅
               <span className="option-cross">✗</span>
             )}
           </button>
@@ -557,17 +702,21 @@ function QuizCard({ data, selectedOption, answered, onAnswer }) {
       </div>
 
       {answered && (
-        <div className={`quiz-feedback ${selectedOption === data.correct_option ? "fb-correct" : "fb-wrong"}`}>
-          {selectedOption === data.correct_option ? (
+        <div className={`quiz-feedback ${selectedOption === correctOpt ? "fb-correct" : "fb-wrong"}`}>  {/* ✅ */}
+          {selectedOption === correctOpt ? (        // ✅
             <>
               <strong>Corect! ✓</strong>
-              {data.explanation && <p>{data.explanation}</p>}
+              {cleanedExplanation && <p>{cleanedExplanation}</p>}
             </>
           ) : (
             <>
-              <strong>Greșit.</strong> Răspunsul corect era{" "}
-              <strong>{data.correct_option.toUpperCase()}</strong>.
-              {data.explanation && <p>{data.explanation}</p>}
+              <strong>Greșit.</strong>{" "}
+              {!explanationHasCorrectAnswerText && (
+                <>
+                  Răspunsul corect era <strong>{correctOpt?.toUpperCase()}</strong>.{" "}
+                </>
+              )}
+              {cleanedExplanation && <p>{cleanedExplanation}</p>}
             </>
           )}
         </div>
